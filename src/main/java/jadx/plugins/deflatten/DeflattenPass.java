@@ -7,6 +7,7 @@ import java.util.HashMap;
 import java.util.HashSet;
 import java.util.IdentityHashMap;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -55,13 +56,13 @@ import jadx.core.utils.InsnRemover;
  * the executed sequence of case blocks is fully static. This pass:
  * <ol>
  * <li>walks the state phi tree to enumerate every {@code (state, case-block)} transition,
- * statically
- * evaluating the selector (see {@link SelectorEval});</li>
- * <li>threads every <i>other</i> loop-carried value (accumulators, cipher handles, ...) that the
- * case
- * bodies read from a header phi: on the linearized path each such read is replaced with the
- * concrete
- * SSA value that phi carried on the edge now leading to that case;</li>
+ * statically evaluating the selector (see {@link SelectorEval}), and groups the transitions by the
+ * <b>target case block</b> they route to;</li>
+ * <li>reconstructs every <i>other</i> loop-carried value (accumulators, cipher handles, loop
+ * indices, ...): a merge phi is inserted at each target reached by several transitions, and each
+ * read
+ * is repointed to the value entering its target — found by reaching-definition (dominator walk) at
+ * the transition source;</li>
  * <li>rewires each transition edge straight to its case block and deletes the dispatcher (header,
  * selector, switch, back-edge merges and the dead default).</li>
  * </ol>
@@ -204,55 +205,45 @@ public class DeflattenPass implements JadxDecompilePass {
 		if (leaves.isEmpty()) {
 			return bail("no leaves");
 		}
-		// 2) group transition edges by state and map each state to its (unique) target case block. A
-		// state assigned by two different case bodies (reconvergence) or by init + a back-edge (a loop)
-		// legitimately has several incoming edges here — that is what earlier versions declined.
-		Map<String, List<Leaf>> edgesByState = new LinkedHashMap<>();
-		Map<String, BlockNode> targetOf = new LinkedHashMap<>();
-		Map<BlockNode, String> targetToState = new LinkedHashMap<>();
+		// 2) group transition edges by their TARGET case block. A target reached by several edges is a
+		// merge — whether from the same next-state string (reconvergence), from init + a back-edge (a
+		// loop), or from two states that route to the same block (a shared `case X: case Y:` body). Each
+		// merge gets one phi per loop-carried variable.
+		Map<BlockNode, List<Leaf>> edgesByTarget = new LinkedHashMap<>();
+		Set<BlockNode> targets = new HashSet<>();
 		for (Leaf leaf : leaves) {
-			edgesByState.computeIfAbsent(leaf.state, k -> new ArrayList<>()).add(leaf);
-			BlockNode prevTarget = targetOf.put(leaf.state, leaf.target);
-			if (prevTarget != null && prevTarget != leaf.target) {
-				return bail("state maps to two targets");
-			}
-			String prevState = targetToState.put(leaf.target, leaf.state);
-			if (prevState != null && !prevState.equals(leaf.state)) {
-				return bail("target shared by two states (hashCode collision?)");
-			}
+			edgesByTarget.computeIfAbsent(leaf.target, k -> new ArrayList<>()).add(leaf);
+			targets.add(leaf.target);
 		}
 		// 3) compute which blocks die once the transitions are rewired
 		Set<BlockNode> dead = deadBlocks(mth, leaves);
 		if (!dead.contains(switchBlock) || !dead.contains(headerBlock)) {
 			return bail("dispatcher core not unreachable after rewire");
 		}
-		// 4) recover the state graph. The case body assigning a state's constant is its predecessor
-		// state; an edge whose constant is not dominated by any case is the entry edge.
-		Map<Leaf, String> predStateOf = new IdentityHashMap<>();
-		String entryState = null;
+		// 4) recover the transition graph over target blocks. An edge originates in the case body that
+		// produced it (the block feeding the state phi, `redirectFrom`); the target case block dominating
+		// that source is the predecessor node. An edge originating in a block dominated by no target is
+		// an entry edge (the pre-header init). A conditional entry (`s = cond ? A : B` before the loop)
+		// yields several entry edges/targets — allowed. Using redirectFrom (the real control-flow source)
+		// rather than the constant's block is robust to constants hoisted through MOVEs/pass-throughs.
+		Map<Leaf, BlockNode> predTargetOf = new IdentityHashMap<>();
+		Set<BlockNode> entryTargets = new LinkedHashSet<>();
 		for (Leaf leaf : leaves) {
-			BlockNode constBlock = insnBlocks.get(leaf.constInsn);
-			if (constBlock == null) {
-				return bail("no block for state const");
-			}
-			String pred = classifyState(constBlock, targetToState);
-			predStateOf.put(leaf, pred);
+			BlockNode pred = classifyTarget(leaf.redirectFrom, targets);
+			predTargetOf.put(leaf, pred);
 			if (pred == null) {
-				if (entryState != null && !entryState.equals(leaf.state)) {
-					return bail("two entry states");
-				}
-				entryState = leaf.state;
+				entryTargets.add(leaf.target);
 			}
 		}
-		if (entryState == null) {
-			return bail("no entry state");
+		if (entryTargets.isEmpty()) {
+			return bail("no entry target");
 		}
-		if (!allStatesReachable(entryState, edgesByState, predStateOf)) {
-			return bail("unreachable state in graph");
+		if (!allTargetsReachable(entryTargets, edgesByTarget, predTargetOf)) {
+			return bail("unreachable target in graph");
 		}
-		// each shared target needs one merge-phi operand per predecessor: the incoming edges must come
-		// from distinct, surviving blocks.
-		for (List<Leaf> es : edgesByState.values()) {
+		// each merge target needs one phi operand per predecessor: its incoming edges must come from
+		// distinct, surviving blocks.
+		for (List<Leaf> es : edgesByTarget.values()) {
 			if (es.size() < 2) {
 				continue;
 			}
@@ -268,8 +259,8 @@ public class DeflattenPass implements JadxDecompilePass {
 		}
 		// 5) plan each loop-carried variable (every header phi but the state phi). For each we record the
 		// value it delivers on each edge (by reaching-def at the edge's source), the reads to repoint,
-		// and a feasibility check that value resolution — with a merge phi inserted at each shared
-		// target — terminates. Nothing is mutated here.
+		// and a feasibility check that value resolution — with a merge phi inserted at each merge target
+		// — terminates. Nothing is mutated here.
 		List<CarriedVar> carried = new ArrayList<>();
 		Set<RegisterArg> replacedUses = new HashSet<>();
 		PhiListAttr headerPhis = headerBlock.get(AType.PHI_LIST);
@@ -291,7 +282,7 @@ public class DeflattenPass implements JadxDecompilePass {
 					}
 					delivered.put(leaf, v);
 				}
-				if (!resolutionFeasible(edgesByState, delivered, predStateOf, rvVar)) {
+				if (!resolutionFeasible(edgesByTarget, delivered, predTargetOf, rvVar)) {
 					return bail("carried value resolution does not terminate");
 				}
 				List<UseSite> uses = new ArrayList<>();
@@ -304,11 +295,11 @@ public class DeflattenPass implements JadxDecompilePass {
 					if (dead.contains(useBlock)) {
 						continue; // structural use inside the dispatcher, torn down with it
 					}
-					String state = classifyState(useBlock, targetToState);
-					if (state == null) {
-						return bail("carried read not attributable to a state");
+					BlockNode target = classifyTarget(useBlock, targets);
+					if (target == null) {
+						return bail("carried read not attributable to a target");
 					}
-					uses.add(new UseSite(use, state));
+					uses.add(new UseSite(use, target));
 					replacedUses.add(use);
 				}
 				carried.add(new CarriedVar(rv, delivered, uses));
@@ -319,14 +310,14 @@ public class DeflattenPass implements JadxDecompilePass {
 			return bail("a surviving value depends on a to-be-deleted block");
 		}
 		int shared = 0;
-		for (List<Leaf> es : edgesByState.values()) {
+		for (List<Leaf> es : edgesByTarget.values()) {
 			if (es.size() >= 2) {
 				shared++;
 			}
 		}
-		LOG.debug("deflatten: planned {} states ({} shared), {} carried, {} dead in {}",
-				edgesByState.size(), shared, carried.size(), dead.size(), mth);
-		return new Plan(leaves, dead, edgesByState, targetOf, predStateOf, entryState, carried);
+		LOG.debug("deflatten: planned {} targets ({} merges), {} carried, {} dead in {}",
+				edgesByTarget.size(), shared, carried.size(), dead.size(), mth);
+		return new Plan(leaves, dead, edgesByTarget, predTargetOf, carried);
 	}
 
 	/** Decline a candidate dispatcher; the reason is logged at DEBUG for diagnosing missed cases. */
@@ -398,15 +389,16 @@ public class DeflattenPass implements JadxDecompilePass {
 
 	/**
 	 * The SSA value of register {@code reg} reaching the end of {@code from} (i.e. what a jump leaving
-	 * {@code from} carries). Walks up the single-predecessor chain until it finds a defining
-	 * instruction
-	 * or a phi for {@code reg}. When it reaches the dispatcher header it returns that carried phi's own
-	 * result ({@code == rvVar}), which callers read as "value unchanged on this edge" (identity).
+	 * {@code from} carries). The reaching definition always dominates {@code from}, so we walk the
+	 * <b>dominator</b> chain (not predecessors) and return the first block that defines {@code reg} —
+	 * an
+	 * instruction result, or a phi. Walking dominators is robust to merges that carry {@code reg}
+	 * unchanged with no phi (they are just skipped) and to loops (the dominator tree is acyclic).
+	 * When the walk reaches the dispatcher header it returns that carried phi's own result
+	 * ({@code == rvVar}), which callers read as "value unchanged on this edge" (identity).
 	 */
 	private static @Nullable RegisterArg reachingValue(int reg, BlockNode from, SSAVar rvVar) {
-		BlockNode cur = from;
-		Set<BlockNode> guard = new HashSet<>();
-		while (cur != null && guard.add(cur)) {
+		for (BlockNode cur = from; cur != null; cur = cur.getIDom()) {
 			List<InsnNode> insns = cur.getInstructions();
 			for (int i = insns.size() - 1; i >= 0; i--) {
 				RegisterArg res = insns.get(i).getResult();
@@ -423,77 +415,87 @@ public class DeflattenPass implements JadxDecompilePass {
 					}
 				}
 			}
-			List<BlockNode> preds = cur.getPredecessors();
-			if (preds.size() == 1) {
-				cur = preds.get(0);
-			} else {
-				return null; // a merge without a phi for reg — shouldn't happen for a live carried var
-			}
 		}
 		return null;
 	}
 
-	/** Every state must be reachable from the entry by following the transition graph. */
-	private static boolean allStatesReachable(String entry, Map<String, List<Leaf>> edgesByState,
-			Map<Leaf, String> predStateOf) {
-		Map<String, List<String>> succOf = new HashMap<>();
-		for (Map.Entry<String, List<Leaf>> e : edgesByState.entrySet()) {
+	/** Every target must be reachable from some entry target by following the transition graph. */
+	private static boolean allTargetsReachable(Set<BlockNode> entries, Map<BlockNode, List<Leaf>> edgesByTarget,
+			Map<Leaf, BlockNode> predTargetOf) {
+		Map<BlockNode, List<BlockNode>> succOf = new HashMap<>();
+		for (Map.Entry<BlockNode, List<Leaf>> e : edgesByTarget.entrySet()) {
 			for (Leaf leaf : e.getValue()) {
-				String pred = predStateOf.get(leaf);
+				BlockNode pred = predTargetOf.get(leaf);
 				if (pred != null) {
 					succOf.computeIfAbsent(pred, k -> new ArrayList<>()).add(e.getKey());
 				}
 			}
 		}
-		Set<String> seen = new HashSet<>();
-		Deque<String> work = new ArrayDeque<>();
-		seen.add(entry);
-		work.add(entry);
+		Set<BlockNode> seen = new HashSet<>(entries);
+		Deque<BlockNode> work = new ArrayDeque<>(entries);
 		while (!work.isEmpty()) {
-			for (String s : succOf.getOrDefault(work.poll(), List.of())) {
+			for (BlockNode s : succOf.getOrDefault(work.poll(), List.of())) {
 				if (seen.add(s)) {
 					work.add(s);
 				}
 			}
 		}
-		return seen.size() == edgesByState.size();
+		return seen.size() == edgesByTarget.size();
 	}
 
 	/**
-	 * Feasibility of carried-value resolution: every single-edge state's value must trace (through
-	 * "unchanged" identity edges) to either a concrete value or a shared-target state (which will hold
-	 * a
-	 * merge phi). Single-edge states cannot form a cycle among themselves — a cycle passes through a
-	 * shared target (a loop header) — so this always terminates when it returns true.
+	 * Feasibility of carried-value resolution: EVERY edge's delivered value must resolve — a concrete
+	 * value directly, or (for an "unchanged"/identity edge) the in-value of its predecessor target,
+	 * which is itself a merge phi or resolves recursively. Identity chains among single-edge targets
+	 * cannot cycle (a cycle passes through a merge target = a loop header, which a phi defines), so
+	 * this
+	 * terminates. Returning true guarantees {@link #rebuildCarried} can bind every phi operand and
+	 * repoint every read without hitting a null.
 	 */
-	private static boolean resolutionFeasible(Map<String, List<Leaf>> edgesByState,
-			Map<Leaf, RegisterArg> delivered, Map<Leaf, String> predStateOf, SSAVar rvVar) {
-		for (String s : edgesByState.keySet()) {
-			if (!feasible(s, edgesByState, delivered, predStateOf, rvVar, new HashSet<>())) {
-				return false;
+	private static boolean resolutionFeasible(Map<BlockNode, List<Leaf>> edgesByTarget,
+			Map<Leaf, RegisterArg> delivered, Map<Leaf, BlockNode> predTargetOf, SSAVar rvVar) {
+		for (List<Leaf> edges : edgesByTarget.values()) {
+			for (Leaf e : edges) {
+				if (!operandResolves(e, edgesByTarget, delivered, predTargetOf, rvVar, new HashSet<>())) {
+					return false;
+				}
 			}
 		}
 		return true;
 	}
 
-	private static boolean feasible(String s, Map<String, List<Leaf>> edgesByState,
-			Map<Leaf, RegisterArg> delivered, Map<Leaf, String> predStateOf, SSAVar rvVar, Set<String> visiting) {
-		if (edgesByState.get(s).size() >= 2) {
-			return true; // a merge phi will define the value here
-		}
-		if (!visiting.add(s)) {
-			return false; // single-edge cycle — not a shape we can resolve
-		}
-		Leaf e = edgesByState.get(s).get(0);
+	/**
+	 * The value {@code e} delivers can be materialised (a concrete value, or a resolvable predecessor).
+	 */
+	private static boolean operandResolves(Leaf e, Map<BlockNode, List<Leaf>> edgesByTarget,
+			Map<Leaf, RegisterArg> delivered, Map<Leaf, BlockNode> predTargetOf, SSAVar rvVar, Set<BlockNode> visiting) {
 		RegisterArg v = delivered.get(e);
 		if (v == null) {
 			return false;
 		}
-		if (v.getSVar() == rvVar) { // unchanged: resolves to the predecessor's value
-			String pred = predStateOf.get(e);
-			return pred != null && feasible(pred, edgesByState, delivered, predStateOf, rvVar, visiting);
+		if (v.getSVar() != rvVar) {
+			return true; // concrete value defined in a surviving block
 		}
-		return true;
+		BlockNode pred = predTargetOf.get(e); // "unchanged": takes the predecessor target's in-value
+		return pred != null && inValResolves(pred, edgesByTarget, delivered, predTargetOf, rvVar, visiting);
+	}
+
+	/**
+	 * The in-value of {@code target} can be materialised (a merge phi, or a resolvable single edge).
+	 */
+	private static boolean inValResolves(BlockNode target, Map<BlockNode, List<Leaf>> edgesByTarget,
+			Map<Leaf, RegisterArg> delivered, Map<Leaf, BlockNode> predTargetOf, SSAVar rvVar, Set<BlockNode> visiting) {
+		List<Leaf> edges = edgesByTarget.get(target);
+		if (edges == null) {
+			return false;
+		}
+		if (edges.size() >= 2) {
+			return true; // a merge phi defines the in-value here
+		}
+		if (!visiting.add(target)) {
+			return false; // single-edge identity cycle — not a shape we can resolve
+		}
+		return operandResolves(edges.get(0), edgesByTarget, delivered, predTargetOf, rvVar, visiting);
 	}
 
 	/** Follow a chain of register {@code MOVE}s to the instruction that actually produces the value. */
@@ -510,14 +512,13 @@ public class DeflattenPass implements JadxDecompilePass {
 	}
 
 	/**
-	 * The state whose target case block dominates {@code block} (i.e. which case body it belongs to).
+	 * The target case block that dominates {@code block} (i.e. which case body it belongs to), or null.
 	 */
-	private static @Nullable String classifyState(BlockNode block, Map<BlockNode, String> targetToState) {
+	private static @Nullable BlockNode classifyTarget(BlockNode block, Set<BlockNode> targets) {
 		BlockNode cur = block;
 		while (cur != null) {
-			String state = targetToState.get(cur);
-			if (state != null) {
-				return state;
+			if (targets.contains(cur)) {
+				return cur;
 			}
 			cur = cur.getIDom();
 		}
@@ -654,64 +655,64 @@ public class DeflattenPass implements JadxDecompilePass {
 		if (carriedType == null || !carriedType.isTypeKnown()) {
 			carriedType = rvVar.getTypeInfo().getType();
 		}
-		Map<String, RegisterArg> inVal = new HashMap<>();
-		Map<String, PhiInsn> phiOf = new LinkedHashMap<>();
-		// 1) placeholder merge phis (fresh SSA var) at each shared-target state
-		for (Map.Entry<String, List<Leaf>> e : plan.edgesByState.entrySet()) {
+		Map<BlockNode, RegisterArg> inVal = new HashMap<>();
+		Map<BlockNode, PhiInsn> phiOf = new LinkedHashMap<>();
+		// 1) placeholder merge phis (fresh SSA var) at each merge target
+		for (Map.Entry<BlockNode, List<Leaf>> e : plan.edgesByTarget.entrySet()) {
 			if (e.getValue().size() < 2) {
 				continue;
 			}
-			BlockNode target = plan.targetOf.get(e.getKey());
+			BlockNode target = e.getKey();
 			PhiInsn phi = SSATransform.addPhi(mth, target, reg);
 			RegisterArg res = cv.rv.duplicateWithNewSSAVar(mth);
 			if (carriedType != null && carriedType.isTypeKnown()) {
 				res.getSVar().setType(carriedType);
 			}
 			phi.setResult(res);
-			phiOf.put(e.getKey(), phi);
-			inVal.put(e.getKey(), res);
+			phiOf.put(target, phi);
+			inVal.put(target, res);
 		}
-		// 2) resolve the value entering every (single-edge) state
-		for (String state : plan.edgesByState.keySet()) {
-			resolveInVal(state, plan, cv, rvVar, inVal);
+		// 2) resolve the value entering every (single-edge) target
+		for (BlockNode target : plan.edgesByTarget.keySet()) {
+			resolveInVal(target, plan, cv, rvVar, inVal);
 		}
 		// 3) bind each merge phi's operands, one per predecessor edge
-		for (Map.Entry<String, PhiInsn> pe : phiOf.entrySet()) {
+		for (Map.Entry<BlockNode, PhiInsn> pe : phiOf.entrySet()) {
 			PhiInsn phi = pe.getValue();
-			for (Leaf leaf : plan.edgesByState.get(pe.getKey())) {
+			for (Leaf leaf : plan.edgesByTarget.get(pe.getKey())) {
 				RegisterArg v = cv.delivered.get(leaf);
-				RegisterArg operand = (v.getSVar() == rvVar) ? inVal.get(plan.predStateOf.get(leaf)) : v;
+				RegisterArg operand = (v.getSVar() == rvVar) ? inVal.get(plan.predTargetOf.get(leaf)) : v;
 				phi.bindArg(operand.duplicate(), leaf.redirectFrom);
 			}
 			phi.rebindArgs();
 		}
-		// 4) repoint every surviving read of the carried variable to its state's value
+		// 4) repoint every surviving read of the carried variable to the value entering its target
 		for (UseSite u : cv.uses) {
 			InsnNode useInsn = u.use.getParentInsn();
 			if (useInsn != null) {
-				useInsn.replaceArg(u.use, inVal.get(u.state).duplicate());
+				useInsn.replaceArg(u.use, inVal.get(u.target).duplicate());
 			}
 		}
 		// 5) collapse any merge phi whose operands are all one value (a carried var unchanged around a
 		// loop) into that value, so it does not surface as a spurious variable.
-		for (Map.Entry<String, PhiInsn> pe : phiOf.entrySet()) {
-			simplifyPhi(mth, plan.targetOf.get(pe.getKey()), pe.getValue());
+		for (Map.Entry<BlockNode, PhiInsn> pe : phiOf.entrySet()) {
+			simplifyPhi(mth, pe.getKey(), pe.getValue());
 		}
 	}
 
-	/** Value of the carried var entering {@code state}; memoised in {@code inVal}. */
-	private static RegisterArg resolveInVal(String state, Plan plan, CarriedVar cv, SSAVar rvVar,
-			Map<String, RegisterArg> inVal) {
-		RegisterArg cached = inVal.get(state);
+	/** Value of the carried var entering {@code target}; memoised in {@code inVal}. */
+	private static RegisterArg resolveInVal(BlockNode target, Plan plan, CarriedVar cv, SSAVar rvVar,
+			Map<BlockNode, RegisterArg> inVal) {
+		RegisterArg cached = inVal.get(target);
 		if (cached != null) {
-			return cached; // shared-target phi result, or already resolved
+			return cached; // merge-target phi result, or already resolved
 		}
-		Leaf e = plan.edgesByState.get(state).get(0); // single edge (shared targets pre-filled above)
+		Leaf e = plan.edgesByTarget.get(target).get(0); // single edge (merge targets pre-filled above)
 		RegisterArg v = cv.delivered.get(e);
 		RegisterArg r = (v.getSVar() == rvVar)
-				? resolveInVal(plan.predStateOf.get(e), plan, cv, rvVar, inVal)
+				? resolveInVal(plan.predTargetOf.get(e), plan, cv, rvVar, inVal)
 				: v;
-		inVal.put(state, r);
+		inVal.put(target, r);
 		return r;
 	}
 
@@ -813,14 +814,14 @@ public class DeflattenPass implements JadxDecompilePass {
 		}
 	}
 
-	/** A read of a loop-carried variable, tagged with the state (case body) it belongs to. */
+	/** A read of a loop-carried variable, tagged with the target case block it belongs to. */
 	private static final class UseSite {
 		final RegisterArg use;
-		final String state;
+		final BlockNode target;
 
-		UseSite(RegisterArg use, String state) {
+		UseSite(RegisterArg use, BlockNode target) {
 			this.use = use;
-			this.state = state;
+			this.target = target;
 		}
 	}
 
@@ -840,21 +841,16 @@ public class DeflattenPass implements JadxDecompilePass {
 	private static final class Plan {
 		final List<Leaf> leaves;
 		final Set<BlockNode> dead;
-		final Map<String, List<Leaf>> edgesByState;
-		final Map<String, BlockNode> targetOf;
-		final Map<Leaf, String> predStateOf;
-		final String entryState;
+		final Map<BlockNode, List<Leaf>> edgesByTarget;
+		final Map<Leaf, BlockNode> predTargetOf;
 		final List<CarriedVar> carried;
 
-		Plan(List<Leaf> leaves, Set<BlockNode> dead, Map<String, List<Leaf>> edgesByState,
-				Map<String, BlockNode> targetOf, Map<Leaf, String> predStateOf, String entryState,
-				List<CarriedVar> carried) {
+		Plan(List<Leaf> leaves, Set<BlockNode> dead, Map<BlockNode, List<Leaf>> edgesByTarget,
+				Map<Leaf, BlockNode> predTargetOf, List<CarriedVar> carried) {
 			this.leaves = leaves;
 			this.dead = dead;
-			this.edgesByState = edgesByState;
-			this.targetOf = targetOf;
-			this.predStateOf = predStateOf;
-			this.entryState = entryState;
+			this.edgesByTarget = edgesByTarget;
+			this.predTargetOf = predTargetOf;
 			this.carried = carried;
 		}
 	}
