@@ -1,0 +1,76 @@
+name: Release
+
+# Tag a commit `vX.Y.Z` (matching build.gradle.kts version + DeflattenPlugin.VERSION) to build the
+# plugin jar and publish it as a GitHub release asset. jadx's plugin installer
+# (`jadx plugins --install github:Arsylk:jadx-deflatten`) reads `releases/latest` and picks the
+# asset whose name starts with the repo name, so the artifact is the only thing it needs.
+on:
+  push:
+    tags: [ "v*.*.*" ]
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  build-release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up JDK
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v6
+
+      - name: Verify tag matches plugin version
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          tag_ver="${GITHUB_REF##*/v}"
+          build_ver=$(grep -oE 'version = "[0-9]+\.[0-9]+\.[0-9]+"' build.gradle.kts | head -1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')
+          plugin_ver=$(grep -oE 'VERSION = "[0-9]+\.[0-9]+\.[0-9]+"' src/main/java/jadx/plugins/deflatten/DeflattenPlugin.java | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')
+          echo "tag=$tag_ver  build.gradle=$build_ver  DeflattenPlugin.VERSION=$plugin_ver"
+          if [ "$tag_ver" != "$build_ver" ] || [ "$tag_ver" != "$plugin_ver" ]; then
+            echo "::error::tag/build/plugin versions out of sync — bump all three (see README)"
+            exit 1
+          fi
+
+      - name: Build jar
+        run: ./gradlew jar --no-daemon
+
+      - name: Locate jar
+        id: jar
+        run: |
+          path="$(ls build/libs/jadx-deflatten-*.jar | grep -vE 'sources|javadoc' | head -1)"
+          echo "path=$path" >> "$GITHUB_OUTPUT"
+          echo "Built: $path"
+
+      - name: Create GitHub release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ steps.jar.outputs.path }}
+          body: |
+            Control-Flow Deflatten plugin for jadx.
+
+            **Install**
+            ```
+            jadx plugins --install github:Arsylk:jadx-deflatten
+            ```
+            or from this jar directly:
+            ```
+            jadx plugins --install-jar jadx-deflatten-<version>.jar
+            ```
+
+            See [README](https://github.com/Arsylk/jadx-deflatten#readme) for the full settings
+            table and what it handles.
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: jadx-deflatten-jar
+          path: ${{ steps.jar.outputs.path }}
