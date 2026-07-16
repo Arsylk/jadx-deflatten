@@ -196,10 +196,15 @@ public class DeflattenPass implements JadxDecompilePass {
 		if (headerBlock == null) {
 			return bail("no header block for state phi");
 		}
-		// 1) enumerate state transitions by walking the (possibly nested) state phi tree
+		// 1) enumerate state transitions by walking the (possibly nested) state phi tree. When the
+		// selector folds an UNKNOWN constant (e.g. an unresolved androidx `SGET` in the XOR chain,
+		// because those libraries are not loaded), SelectorEval can't evaluate it. But the selector is
+		// still `hashCode(state) ^ M` for a fixed mask M, so derive M from the constraint that the state
+		// strings map bijectively onto the case keys, and route by `hashCode(state) ^ M` instead.
+		Integer xorMask = deriveXorMask(statePhi, stateVar, sw);
 		List<Leaf> leaves = new ArrayList<>();
 		if (!collectLeaves(statePhi, headerBlock, new ArrayList<>(), selector, stateVar, sw,
-				switchBlock, headerBlock, insnBlocks, leaves, new IdentityHashMap<>())) {
+				switchBlock, headerBlock, insnBlocks, leaves, new IdentityHashMap<>(), xorMask)) {
 			return bail("collectLeaves failed");
 		}
 		if (leaves.isEmpty()) {
@@ -320,6 +325,70 @@ public class DeflattenPass implements JadxDecompilePass {
 		return new Plan(leaves, dead, edgesByTarget, predTargetOf, carried);
 	}
 
+	/**
+	 * Derive the XOR mask {@code M} for a selector of the form {@code state.hashCode() ^ M} whose
+	 * constants can't all be folded (an unresolved static field is XORed in). {@code M} is the value
+	 * that maps every state string bijectively onto a distinct case key, so try {@code M = hashCode(s0)
+	 * ^ k} for each key {@code k} and keep the one under which every state routes to a distinct valid
+	 * key. Returns {@code null} when no such mask exists (the selector is not a pure XOR chain, or the
+	 * constants are all known — in which case {@link SelectorEval} handles it directly).
+	 */
+	private @Nullable Integer deriveXorMask(PhiInsn statePhi, SSAVar stateVar, SwitchInsn sw) {
+		Set<String> strings = new LinkedHashSet<>();
+		collectStateStrings(statePhi, stateVar, new IdentityHashMap<>(), strings);
+		int[] keys = sw.getKeys();
+		if (strings.isEmpty() || keys == null || keys.length == 0) {
+			return null;
+		}
+		Set<Integer> keySet = new HashSet<>();
+		for (int k : keys) {
+			keySet.add(k);
+		}
+		String first = strings.iterator().next();
+		Integer found = null;
+		for (int k : keys) {
+			int m = first.hashCode() ^ k;
+			Set<Integer> mapped = new HashSet<>();
+			boolean ok = true;
+			for (String s : strings) {
+				int key = s.hashCode() ^ m;
+				if (!keySet.contains(key) || !mapped.add(key)) {
+					ok = false;
+					break;
+				}
+			}
+			if (ok) {
+				if (found != null) {
+					return null; // ambiguous: more than one mask yields a valid bijection — not safe
+				}
+				found = m;
+			}
+		}
+		return found;
+	}
+
+	/** Collect every constant state string reachable through the (nested) state phi tree. */
+	private void collectStateStrings(PhiInsn phi, SSAVar stateVar, IdentityHashMap<PhiInsn, Boolean> seen, Set<String> out) {
+		if (seen.put(phi, Boolean.TRUE) != null) {
+			return;
+		}
+		for (int i = 0; i < phi.getArgsCount(); i++) {
+			RegisterArg op = phi.getArg(i);
+			if (op.getSVar() == null) {
+				continue;
+			}
+			InsnNode def = resolveThroughMoves(op.getSVar().getAssignInsn());
+			if (def == stateVar.getAssignInsn()) {
+				continue;
+			}
+			if (def instanceof ConstStringNode) {
+				out.add(((ConstStringNode) def).getString());
+			} else if (def instanceof PhiInsn) {
+				collectStateStrings((PhiInsn) def, stateVar, seen, out);
+			}
+		}
+	}
+
 	/** Decline a candidate dispatcher; the reason is logged at DEBUG for diagnosing missed cases. */
 	private static @Nullable Plan bail(String reason) {
 		LOG.debug("deflatten: bail — {}", reason);
@@ -333,7 +402,8 @@ public class DeflattenPass implements JadxDecompilePass {
 	 */
 	private boolean collectLeaves(PhiInsn phi, BlockNode phiBlock, List<BlockNode> path, InsnArg selector,
 			SSAVar stateVar, SwitchInsn sw, BlockNode switchBlock, BlockNode headerBlock,
-			Map<InsnNode, BlockNode> insnBlocks, List<Leaf> out, IdentityHashMap<PhiInsn, Boolean> seen) {
+			Map<InsnNode, BlockNode> insnBlocks, List<Leaf> out, IdentityHashMap<PhiInsn, Boolean> seen,
+			@Nullable Integer xorMask) {
 		if (seen.put(phi, Boolean.TRUE) != null) {
 			return false;
 		}
@@ -357,7 +427,12 @@ public class DeflattenPass implements JadxDecompilePass {
 			newPath.add(pred);
 			if (def instanceof ConstStringNode) {
 				String value = ((ConstStringNode) def).getString();
+				// Fold the selector directly when its constants are known; fall back to the derived XOR
+				// mask only when they aren't (an unresolved static field in the chain).
 				Integer key = SelectorEval.eval(selector, stateVar, value);
+				if (key == null && xorMask != null) {
+					key = value.hashCode() ^ xorMask;
+				}
 				if (key == null) {
 					return false;
 				}
@@ -377,7 +452,7 @@ public class DeflattenPass implements JadxDecompilePass {
 					return false;
 				}
 				if (!collectLeaves((PhiInsn) def, nestedBlock, newPath, selector, stateVar, sw,
-						switchBlock, headerBlock, insnBlocks, out, seen)) {
+						switchBlock, headerBlock, insnBlocks, out, seen, xorMask)) {
 					return false;
 				}
 			} else {
